@@ -1,0 +1,11 @@
+playwright>=1.40.0,<2.0.0
+python-dotenv>=1.0.0
+# For the calendar/deadlines feed (MCGILL_ICAL_URL) - a plain HTTP+iCal fetch,
+# no browser/login needed at all.
+requests>=2.31.0,<3.0.0
+icalendar>=5.0.0,<8.0.0
+# Pinned to the 2.x line: mcp_server.py uses mcp.server.mcpserver.MCPServer
+# (2.x's renamed FastMCP). mcp 1.x used a different, incompatible low-level
+# Server API (@server.list_tools()/@server.call_tool()) - do not loosen this
+# without updating mcp_server.py to match.
+mcp>=2.1.0,<3.0.0

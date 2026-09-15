@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "mycourses-mcgill": {
+      "command": "/absolute/path/to/mcgill-mycourses-mcp/venv/bin/python",
+      "args": [
+        "/absolute/path/to/mcgill-mycourses-mcp/mcp_server.py"
+      ]
+    }
+  }
+}
