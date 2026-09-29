@@ -4,6 +4,9 @@ python-dotenv>=1.0.0
 # no browser/login needed at all.
 requests>=2.31.0,<3.0.0
 icalendar>=5.0.0,<8.0.0
+# Timezone database for zoneinfo - Windows has no system tz data, so without
+# this package deadlines can't be shown in Montreal time.
+tzdata>=2024.1
 # Pinned to the 2.x line: mcp_server.py uses mcp.server.mcpserver.MCPServer
 # (2.x's renamed FastMCP). mcp 1.x used a different, incompatible low-level
 # Server API (@server.list_tools()/@server.call_tool()) - do not loosen this

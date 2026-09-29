@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "mycourses-mcgill": {
+      "command": "C:\\Users\\YOUR_USER\\mcgill-mycourses-mcp\\venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\YOUR_USER\\mcgill-mycourses-mcp\\mcp_server.py"
+      ]
+    }
+  }
+}

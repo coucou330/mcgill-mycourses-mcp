@@ -12,25 +12,36 @@ def create_virtual_environment():
     """Create virtual environment for the project"""
     print("Creating virtual environment...")
     
-    # Try Python 3.12 first (more compatible with Playwright)
-    python_versions = ["python3.12", "python3.11", "python3"]
+    # Try Python 3.12 first (more compatible with Playwright). On Windows the
+    # python.org installer provides the `py` launcher (and `python`), not
+    # `python3.12` - and `python3` there is often the Microsoft Store stub.
+    candidates = [
+        ["py", "-3.12"], ["python3.12"],
+        ["py", "-3.11"], ["python3.11"],
+        ["python3"], ["python"],
+    ]
     python_executable = None
-    
-    for python_cmd in python_versions:
+
+    for cmd in candidates:
         try:
-            result = subprocess.run([python_cmd, "--version"], capture_output=True, text=True)
-            if result.returncode == 0:
-                print(f"Using {python_cmd}: {result.stdout.strip()}")
-                python_executable = python_cmd
-                break
-        except FileNotFoundError:
+            result = subprocess.run(
+                cmd + ["-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
-    
+        version = result.stdout.strip()
+        if result.returncode == 0 and version in ("3.11", "3.12"):
+            print(f"Using {' '.join(cmd)}: Python {version}")
+            python_executable = cmd
+            break
+
     if not python_executable:
-        print("Error: No compatible Python version found. Please install Python 3.11 or 3.12")
+        print("Error: No compatible Python version found. Please install Python 3.12 "
+              "(Windows: `winget install -e --id Python.Python.3.12`)")
         sys.exit(1)
-    
-    subprocess.check_call([python_executable, "-m", "venv", "venv"])
+
+    subprocess.check_call(python_executable + ["-m", "venv", "venv"])
     print("✓ Virtual environment created")
     
     # Determine the correct activation script path and Python executable

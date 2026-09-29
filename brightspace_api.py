@@ -7,15 +7,19 @@ import time
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+import re
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Dict, List, Optional
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 import requests
 import icalendar
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from the .env next to this file (not the cwd -
+# an MCP client may launch us from anywhere). interpolate=False: a password
+# containing "${...}" must be taken literally, not expanded as a variable.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), interpolate=False)
 
 
 def log(*args, **kwargs):
@@ -45,6 +49,77 @@ def _debug_path(filename: str) -> str:
 # McGill's Brightspace instance
 BASE_URL = "https://mycourses2.mcgill.ca"
 HOME_URL = f"{BASE_URL}/d2l/home"
+
+# Where get_courses() caches the course-id -> course-code map, so that
+# get_calendar can label events without ever launching a browser/login.
+COURSE_CACHE_PATH = _debug_path(".mcgill_courses_cache.json")
+
+
+class LoginRequired(Exception):
+    """
+    Raised when the cached session is missing/expired and the caller asked
+    for no interactive login (allow_interactive=False) - e.g. an unattended,
+    scheduled assistant run where nobody is there to type the MFA code.
+    """
+
+
+def get_local_tz() -> tzinfo:
+    """
+    Timezone used to display event times. myCourses' iCal feed is in UTC, so
+    printing raw times shows e.g. a Monday 23:59 (Montreal) deadline as
+    "Tuesday 03:59" - off by a day. Override with MYCOURSES_TIMEZONE.
+
+    On Windows, Python has no system timezone database: the `tzdata` package
+    (in requirements.txt) provides it. Falls back to UTC if unavailable.
+    """
+    name = os.getenv("MYCOURSES_TIMEZONE", "America/Toronto")
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        log(f"Unknown timezone {name!r} (is the 'tzdata' package installed?) - using UTC.")
+        return timezone.utc
+
+
+def extract_course_code(course_name: str) -> str:
+    """
+    "Fall 2026 - ECSE-307-001 - Linear Systems and Control" -> "ECSE 307".
+    McGill formats course codes with hyphens, not spaces, between the
+    department and the number (e.g. "COMP-202", "ECSE-458D1").
+    """
+    match = re.search(r'([A-Z]{3,4})-(\d{3}[A-Z0-9]*)', course_name or "")
+    if match:
+        return f"{match.group(1)} {match.group(2)}"
+    return course_name.split(' - ')[0] if ' - ' in (course_name or "") else (course_name or "")
+
+
+def course_id_from_url(course_url: str) -> Optional[str]:
+    """"/d2l/home/880685" (or an absolute URL) -> "880685"."""
+    m = re.search(r'/d2l/home/(\d+)', course_url or "")
+    return m.group(1) if m else None
+
+
+def save_course_cache(courses: List["Course"]) -> None:
+    """Persist {course_id: course_code} so calendar labeling needs no login."""
+    mapping = {}
+    for c in courses:
+        cid = course_id_from_url(c.url)
+        if cid:
+            mapping[cid] = c.code
+    if not mapping:
+        return
+    try:
+        with open(COURSE_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, indent=2)
+    except OSError as e:
+        log(f"Could not write course cache: {e}")
+
+
+def load_course_cache() -> Dict[str, str]:
+    try:
+        with open(COURSE_CACHE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
 
 
 @dataclass
@@ -76,6 +151,15 @@ class CalendarEvent:
     course_id: Optional[str]  # numeric org-unit id, same as get_courses()'s
     # Course.url id - None for institution-wide events (course evals, etc.)
     # not tied to any specific course
+    course_name: Optional[str] = None  # the event's LOCATION, which D2L sets
+    # to the full course name ("Fall 2026 - ECSE-307-001 - Linear Systems
+    # and Control") - lets us label events without any login/scraping
+    url: Optional[str] = None  # direct link to the item (e.g. the assignment's
+    # submission page) if the description has one, else the "View event" link
+
+    @property
+    def course_code(self) -> Optional[str]:
+        return extract_course_code(self.course_name) if self.course_name else None
 
 
 def fetch_calendar_events(ical_url: str, timeout: int = 30) -> List[CalendarEvent]:
@@ -106,8 +190,6 @@ def fetch_calendar_events(ical_url: str, timeout: int = 30) -> List[CalendarEven
     response = requests.get(ical_url, timeout=timeout)
     response.raise_for_status()
 
-    import re
-
     calendar = icalendar.Calendar.from_ical(response.content)
     events = []
     for component in calendar.walk("VEVENT"):
@@ -117,7 +199,10 @@ def fetch_calendar_events(ical_url: str, timeout: int = 30) -> List[CalendarEven
         dt = dtstart.dt
         all_day = not isinstance(dt, datetime)
         if all_day:
-            dt = datetime.combine(dt, datetime.min.time(), tzinfo=timezone.utc)
+            # Anchor all-day events at local midnight (not UTC midnight, which
+            # is the previous evening in Montreal) so they sort and filter on
+            # the right day next to timed events.
+            dt = datetime.combine(dt, datetime.min.time(), tzinfo=get_local_tz())
         elif dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
 
@@ -130,12 +215,29 @@ def fetch_calendar_events(ical_url: str, timeout: int = 30) -> List[CalendarEven
         description = str(component.get("description", ""))
         course_match = re.search(r'/calendar/(\d+)/event/', description)
 
+        # D2L puts the full course name in LOCATION (e.g. "Fall 2026 -
+        # ECSE-307-001 - Linear Systems and Control"), which is enough to
+        # label the event - no get_courses() scrape (and so no login) needed.
+        location = str(component.get("location", "")).strip() or None
+
+        # Prefer the item's own link (e.g. "Assignment 4 - https://.../
+        # folder_submit_files.d2l?ou=...&db=...") over the generic
+        # "View event - ..." link that every course event ends with.
+        view_match = re.search(r'View event\s*-\s*(https?://\S+)', description)
+        view_url = view_match.group(1) if view_match else None
+        item_url = next(
+            (u for u in re.findall(r'https?://\S+', description) if u != view_url),
+            None,
+        )
+
         events.append(CalendarEvent(
             summary=str(component.get("summary", "")),
             start=dt,
             all_day=all_day,
             uid=str(component.get("uid", "")),
             course_id=course_match.group(1) if course_match else None,
+            course_name=location,
+            url=item_url or view_url,
         ))
 
     return events
@@ -240,7 +342,7 @@ class BrightspaceScraper:
         except Exception:
             return False
 
-    def login(self, username: str, password: str) -> bool:
+    def login(self, username: str, password: str, allow_interactive: bool = True) -> bool:
         """
         Login to McGill myCourses via Microsoft (Entra ID / Office 365) SSO.
 
@@ -266,9 +368,16 @@ class BrightspaceScraper:
         Args:
             username: McGill username or full email (e.g. you@mcgill.ca)
             password: McGill password
+            allow_interactive: if False and the cached session is missing or
+                expired, raise LoginRequired immediately instead of opening a
+                visible browser window and waiting for an MFA code. Use this
+                for unattended/scheduled callers.
 
         Returns:
             bool: True if login successful, False otherwise
+
+        Raises:
+            LoginRequired: session invalid and allow_interactive is False.
         """
         try:
             # If we restored a session from disk, check whether it's still valid
@@ -278,6 +387,14 @@ class BrightspaceScraper:
                     log("Restored session is still valid, skipping login.")
                     return True
                 log("Restored session expired, doing a fresh login...")
+
+            if not allow_interactive:
+                raise LoginRequired(
+                    "No valid myCourses session cached, and interactive login "
+                    "was not allowed (allow_login=False). Run any myCourses "
+                    "tool once with allow_login=True while someone is at the "
+                    "computer to type the Authenticator code."
+                )
 
             # A real login means typing an MFA code into the page - impossible
             # headless. Auto-switch to a visible window right here, only when
@@ -399,6 +516,8 @@ class BrightspaceScraper:
                 self.page.screenshot(path=_debug_path("login_final_step_debug.png"))
                 return False
 
+        except LoginRequired:
+            raise
         except Exception as e:
             log(f"Login error: {e}")
             return False
@@ -619,15 +738,8 @@ class BrightspaceScraper:
             return []
 
     def _extract_course_code(self, course_name: str) -> str:
-        """Extract course code from course name"""
-        # McGill formats course codes like "COMP-202", "MATH-240D1-001" (hyphens,
-        # not spaces, between the department and the number) - e.g. full names
-        # look like "Fall 2026 - COMP-202-001 - Foundations of Programming".
-        import re
-        match = re.search(r'([A-Z]{3,4})-(\d{3}[A-Z0-9]*)', course_name)
-        if match:
-            return f"{match.group(1)} {match.group(2)}"
-        return course_name.split(' - ')[0] if ' - ' in course_name else course_name
+        """Extract course code from course name (see extract_course_code)"""
+        return extract_course_code(course_name)
 
     def _extract_course_from_url(self, url: str) -> str:
         """Extract course name from URL"""

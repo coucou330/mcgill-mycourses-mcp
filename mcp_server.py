@@ -13,13 +13,18 @@ from brightspace_api import (
     Course,
     Assignment,
     CalendarEvent,
+    LoginRequired,
     SCRIPT_DIR,
     log,
     fetch_calendar_events,
     filter_events_by_range,
+    get_local_tz,
+    course_id_from_url,
+    save_course_cache,
+    load_course_cache,
 )
 
-load_dotenv()
+load_dotenv(os.path.join(SCRIPT_DIR, ".env"), interpolate=False)
 
 # Resolve relative to this file's directory, not the process cwd - an MCP
 # client (e.g. Claude Desktop) may launch this script from anywhere.
@@ -33,6 +38,13 @@ HEADLESS = os.getenv("HEADLESS", "True").lower() == "true"
 
 mcp = MCPServer("mycourses-mcgill")
 
+_LOGIN_FAILED = (
+    "Login to myCourses failed. Check for a login_*_debug.png "
+    f"screenshot in {SCRIPT_DIR} to see exactly which step it "
+    "stopped at, or run `python testing/playwright_trial.py` "
+    "with HEADLESS=False to debug interactively."
+)
+
 
 def _get_credentials() -> tuple[str, str]:
     username = os.getenv("MCGILL_USERNAME")
@@ -45,26 +57,37 @@ def _get_credentials() -> tuple[str, str]:
     return username, password
 
 
-def _fetch_courses_sync() -> list[Course]:
+def _login_or_raise(scraper: BrightspaceScraper, allow_login: bool) -> None:
     username, password = _get_credentials()
+    if not scraper.login(username, password, allow_interactive=allow_login):
+        raise RuntimeError(_LOGIN_FAILED)
+
+
+def _fetch_courses_sync(allow_login: bool = True) -> list[Course]:
     with BrightspaceScraper(headless=HEADLESS, storage_state_path=SESSION_PATH) as scraper:
-        if not scraper.login(username, password):
-            raise RuntimeError(
-                "Login to myCourses failed. Check for a login_*_debug.png "
-                f"screenshot in {SCRIPT_DIR} to see exactly which step it "
-                "stopped at, or run `python testing/playwright_trial.py` "
-                "with HEADLESS=False to debug interactively."
-            )
-        return scraper.get_courses()
+        _login_or_raise(scraper, allow_login)
+        courses = scraper.get_courses()
+    save_course_cache(courses)
+    return courses
 
 
-def _course_id_from_url(course_url: str) -> str | None:
-    import re
-    m = re.search(r'/d2l/home/(\d+)', course_url)
-    return m.group(1) if m else None
+def _fetch_assignments_sync(course_url: str, allow_login: bool = True) -> list[Assignment]:
+    with BrightspaceScraper(headless=HEADLESS, storage_state_path=SESSION_PATH) as scraper:
+        _login_or_raise(scraper, allow_login)
+        return scraper.get_assignments(course_url)
 
 
-def _fetch_calendar_sync(days_ahead: int, days_behind: int) -> tuple[list[CalendarEvent], dict[str, str]]:
+def _fetch_all_assignments_sync(allow_login: bool = True) -> list[tuple[Course, list[Assignment]]]:
+    # One browser + one login for every course, instead of one per course.
+    with BrightspaceScraper(headless=HEADLESS, storage_state_path=SESSION_PATH) as scraper:
+        _login_or_raise(scraper, allow_login)
+        courses = scraper.get_courses()
+        results = [(c, scraper.get_assignments(c.url)) for c in courses]
+    save_course_cache(courses)
+    return results
+
+
+def _fetch_calendar_sync(days_ahead: int, days_behind: int) -> list[CalendarEvent]:
     ical_url = os.getenv("MCGILL_ICAL_URL")
     if not ical_url:
         raise RuntimeError(
@@ -72,35 +95,34 @@ def _fetch_calendar_sync(days_ahead: int, days_behind: int) -> tuple[list[Calend
             "Calendar > Subscribe > \"All Calendars and Tasks\" > copy the feed URL."
         )
     events = fetch_calendar_events(ical_url)
-    events = filter_events_by_range(events, days_ahead=days_ahead, days_behind=days_behind)
-
-    # Best-effort: label each event with its course code. This is the one
-    # place get_calendar touches BrightspaceScraper/Playwright at all - if it
-    # fails (session expired, etc.) we still return the events, just without
-    # course labels, rather than failing the whole call.
-    course_map: dict[str, str] = {}
-    try:
-        for course in _fetch_courses_sync():
-            course_id = _course_id_from_url(course.url)
-            if course_id:
-                course_map[course_id] = course.code
-    except Exception as e:
-        log(f"get_calendar: could not label events with course codes: {e}")
-
-    return events, course_map
+    return filter_events_by_range(events, days_ahead=days_ahead, days_behind=days_behind)
 
 
-def _fetch_assignments_sync(course_url: str) -> list[Assignment]:
-    username, password = _get_credentials()
-    with BrightspaceScraper(headless=HEADLESS, storage_state_path=SESSION_PATH) as scraper:
-        if not scraper.login(username, password):
-            raise RuntimeError(
-                "Login to myCourses failed. Check for a login_*_debug.png "
-                f"screenshot in {SCRIPT_DIR} to see exactly which step it "
-                "stopped at, or run `python testing/playwright_trial.py` "
-                "with HEADLESS=False to debug interactively."
-            )
-        return scraper.get_assignments(course_url)
+def _course_label(e: CalendarEvent, course_map: dict[str, str]) -> str:
+    # 1) the event's own LOCATION (course name) - always there for course events
+    # 2) the course-id cache written by get_courses - never triggers a login
+    # 3) raw id / "General" for institution-wide events
+    if e.course_code:
+        return e.course_code
+    if e.course_id:
+        return course_map.get(e.course_id, f"course {e.course_id}")
+    return "General"
+
+
+def _format_when(e: CalendarEvent) -> str:
+    if e.all_day:
+        # All-day events are stored as midnight UTC: use the date as-is, a tz
+        # conversion would shift it to the previous evening in Montreal.
+        return e.start.strftime("%a %Y-%m-%d") + " (all day)"
+    return e.start.astimezone(get_local_tz()).strftime("%a %Y-%m-%d %H:%M")
+
+
+def _norm(s: str) -> str:
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+
+def _login_required_msg(e: LoginRequired) -> str:
+    return f"LOGIN_REQUIRED: {e}"
 
 
 @mcp.tool()
@@ -110,10 +132,19 @@ async def hello() -> str:
 
 
 @mcp.tool()
-async def get_courses() -> str:
-    """List all courses the McGill student is currently enrolled in on myCourses"""
+async def get_courses(allow_login: bool = True) -> str:
+    """List all courses the McGill student is currently enrolled in on myCourses.
+
+    Args:
+        allow_login: if the cached session has expired, open a browser window
+            so the student can log in (MFA code). Pass False for unattended /
+            scheduled runs: the tool then returns LOGIN_REQUIRED instead of
+            waiting for someone to type a code.
+    """
     try:
-        courses = await asyncio.to_thread(_fetch_courses_sync)
+        courses = await asyncio.to_thread(_fetch_courses_sync, allow_login)
+    except LoginRequired as e:
+        return _login_required_msg(e)
     except Exception as e:
         return f"Error fetching courses: {e}"
 
@@ -125,15 +156,18 @@ async def get_courses() -> str:
 
 
 @mcp.tool()
-async def get_assignments(course_url: str) -> str:
-    """List assignments for a specific myCourses course.
+async def get_assignments(course_url: str, allow_login: bool = True) -> str:
+    """List assignments (due date, submission status, score) for ONE course.
 
     Args:
         course_url: URL (absolute, or the relative /d2l/home/... path) of the
             course, as returned by get_courses.
+        allow_login: see get_courses. Pass False for unattended runs.
     """
     try:
-        assignments = await asyncio.to_thread(_fetch_assignments_sync, course_url)
+        assignments = await asyncio.to_thread(_fetch_assignments_sync, course_url, allow_login)
+    except LoginRequired as e:
+        return _login_required_msg(e)
     except Exception as e:
         return f"Error fetching assignments: {e}"
 
@@ -148,7 +182,36 @@ async def get_assignments(course_url: str) -> str:
 
 
 @mcp.tool()
-async def get_calendar(days_ahead: int = 14, days_behind: int = 1) -> str:
+async def get_all_assignments(allow_login: bool = True) -> str:
+    """List assignments (due date, submission status, score) for EVERY enrolled
+    course in one call - one browser session and one login for all courses.
+    Use this for "what's left to hand in?" / "where am I in each course?".
+
+    Args:
+        allow_login: see get_courses. Pass False for unattended runs.
+    """
+    try:
+        results = await asyncio.to_thread(_fetch_all_assignments_sync, allow_login)
+    except LoginRequired as e:
+        return _login_required_msg(e)
+    except Exception as e:
+        return f"Error fetching assignments: {e}"
+
+    if not results:
+        return "No courses found."
+
+    out = []
+    for course, assignments in results:
+        out.append(f"## {course.code} — {course.name}")
+        if not assignments:
+            out.append("- (no assignments found)")
+        for a in assignments:
+            out.append(f"- {a.title} (Due: {a.due_date}, Status: {a.status})")
+    return "\n".join(out)
+
+
+@mcp.tool()
+async def get_calendar(days_ahead: int = 14, days_behind: int = 1, course: str = "") -> str:
     """Get upcoming (and recently past) events/deadlines across ALL myCourses
     courses at once, via McGill's personal calendar feed.
 
@@ -156,30 +219,42 @@ async def get_calendar(days_ahead: int = 14, days_behind: int = 1) -> str:
     get_assignments (which only sees one course's Dropbox at a time), this
     covers every course in a single call and also picks up events that never
     show up in Dropbox at all (content release dates, project milestones,
-    etc.). No login/MFA involved - it's a direct, token-authenticated feed.
+    etc.). No login/MFA/browser involved - it's a direct, token-authenticated
+    feed, so it is safe for unattended runs. Times are shown in the local
+    timezone (MYCOURSES_TIMEZONE, default America/Toronto).
 
     Args:
         days_ahead: how many days into the future to include (default 14)
         days_behind: how many days into the past to include (default 1)
+        course: optional filter, e.g. "ECSE 307" or "ecse307" (matches the
+            course code or name)
     """
     try:
-        events, course_map = await asyncio.to_thread(_fetch_calendar_sync, days_ahead, days_behind)
+        events = await asyncio.to_thread(_fetch_calendar_sync, days_ahead, days_behind)
     except Exception as e:
         return f"Error fetching calendar: {e}"
 
-    if not events:
-        return f"No events found in the next {days_ahead} days."
+    course_map = load_course_cache()
+    if course:
+        wanted = _norm(course)
+        events = [
+            e for e in events
+            if wanted in _norm(_course_label(e, course_map)) or wanted in _norm(e.course_name or "")
+        ]
 
+    if not events:
+        scope = f" for {course}" if course else ""
+        return f"No events found{scope} in the next {days_ahead} days."
+
+    tz = get_local_tz()
     lines = []
     for e in events:
-        date_str = e.start.strftime('%Y-%m-%d' if e.all_day else '%Y-%m-%d %H:%M')
-        if e.course_id:
-            course_label = course_map.get(e.course_id, f"course {e.course_id}")
-        else:
-            course_label = "General"
-        lines.append(f"- [{course_label}] {date_str}: {e.summary}")
+        line = f"- [{_course_label(e, course_map)}] {_format_when(e)}: {e.summary}"
+        if e.url:
+            line += f" — {e.url}"
+        lines.append(line)
 
-    return "Upcoming events:\n" + "\n".join(lines)
+    return f"Upcoming events (times in {getattr(tz, 'key', 'UTC')}):\n" + "\n".join(lines)
 
 
 if __name__ == "__main__":

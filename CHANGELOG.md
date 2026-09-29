@@ -1,5 +1,38 @@
 # Changelog
 
+## [2.3.0] - 2026-09-29
+
+### Fixed
+- **`get_calendar` showed deadlines in UTC.** The iCal feed is in UTC, so a
+  Monday 23:59 (Montreal) deadline was printed as "Tuesday 03:59" - the wrong
+  day. Times are now converted to `MYCOURSES_TIMEZONE` (default
+  `America/Toronto`) and prefixed with the weekday. All-day events are
+  anchored at local midnight so they sort on the right day.
+- **`get_calendar` could trigger a login.** Course labeling used to call
+  `get_courses()` (Playwright + possibly an MFA pop-up) on every call. Labels
+  now come from each event's `LOCATION` (D2L sets it to the full course name),
+  with a no-login fallback on a course-id cache written by `get_courses`.
+- **Windows:** `setup.py` now finds Python through the `py` launcher (python.org
+  installs don't ship `python3.12`, and `python3` is often the Store stub);
+  `tzdata` added to requirements (Windows has no system timezone database);
+  `.env` is loaded from the script directory whatever the launch cwd, without
+  `${...}` interpolation (passwords are taken literally).
+
+### Added
+- `install_windows.ps1`: one-command installer (download, Python 3.12 via
+  winget, venv, deps, Chromium, `.env` prompts, Claude Desktop config merge
+  with backup). Tested: parse, `.env` quoting round-trip through
+  python-dotenv, and config merge/idempotency (PowerShell 7).
+- `allow_login` argument on `get_courses` / `get_assignments` /
+  `get_all_assignments`: `False` returns `LOGIN_REQUIRED` instead of opening
+  a login window - for unattended/scheduled assistants.
+- `get_all_assignments`: every course's assignments (status/score) in one
+  browser session. Composed from the live-verified `get_courses` and
+  `get_assignments`; not yet verified live as a whole.
+- `get_calendar(course=...)` filter and a direct link to each assignment's
+  submission page.
+- `claude_desktop_config.windows.example.json`.
+
 ## [2.2.0] - 2026-09-03
 
 ### Added

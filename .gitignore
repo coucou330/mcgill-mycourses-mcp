@@ -60,6 +60,9 @@ brightspace_data.json
 .mcgill_session.json
 *_session.json
 
+# Local course-id -> course-code cache written by get_courses
+.mcgill_courses_cache.json
+
 # But allow configuration examples
 !claude_desktop_config.example.json
 !requirements.txt
