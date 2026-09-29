@@ -9,9 +9,11 @@
 #   2. finds Python 3.12/3.11 (installs 3.12 with winget if missing)
 #   3. creates the venv, installs the requirements and Playwright's Chromium
 #   4. asks for your McGill email/password + calendar feed URL and writes .env
-#      (only on this PC, never uploaded anywhere)
-#   5. registers the server in Claude Desktop's claude_desktop_config.json
-#      (a timestamped .bak copy of the old config is kept next to it)
+#      (only on this PC, never uploaded anywhere; re-asked if the address is not @mcgill.ca)
+#   5. starts the server once over stdio, like Claude Desktop does (self-test)
+#   6. registers it in Claude Desktop's claude_desktop_config.json - Microsoft Store
+#      (MSIX) builds included (a timestamped .bak of the old config is kept next to it)
+#   7. restarts Claude Desktop so it loads the server
 #
 # Set $env:MYCOURSES_REPO = "owner/repo" before running to install from another fork.
 
@@ -92,18 +94,39 @@
     # ---------------------------------------------------------------- 4. .env
     Step "Credentials (.env)"
     $envFile = Join-Path $Dest '.env'
+    $existing = @{}
     if (Test-Path $envFile) {
-        Ok ".env already exists - kept as is (edit it with Notepad to change anything)"
+        foreach ($l in [IO.File]::ReadAllLines($envFile)) {
+            if ($l -match '^\s*([A-Za-z_]+)\s*=\s*(.*)$') { $existing[$matches[1]] = $matches[2] }
+        }
+    }
+    # McGill's SSO only accepts a McGill account: a Gmail/Outlook address ends in
+    # AADSTS50020 ("account does not exist in tenant 'McGill University'").
+    $userOk = [string]$existing['MCGILL_USERNAME'] -match 'mcgill\.ca'
+    if ((Test-Path $envFile) -and $userOk) {
+        Ok ".env already exists with a McGill address - kept as is"
     } else {
+        if (Test-Path $envFile) { Warn "The username in .env is not a McGill address - asking again." }
         function Quote-Env([string]$s) { "'" + (($s -replace '\\', '\\') -replace "'", "\'") + "'" }
-        $user = Read-Host "McGill email (e.g. firstname.lastname@mail.mcgill.ca)"
-        $sec  = Read-Host "McGill password (stored only in $envFile on this PC)" -AsSecureString
+        do {
+            $user = (Read-Host "McGill email (firstname.lastname@mail.mcgill.ca - NOT your Gmail)").Trim()
+            if ($user -notmatch '@(mail\.)?mcgill\.ca$') { Warn "That is not a McGill address (must end with @mail.mcgill.ca or @mcgill.ca)." }
+        } until ($user -match '@(mail\.)?mcgill\.ca$')
+        $sec  = Read-Host "McGill password (the one you use for myCourses/Minerva; stored only in $envFile)" -AsSecureString
         $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
         try { $pw = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
         finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-        Write-Host "    myCourses calendar feed: myCourses > Calendar > Subscribe > 'All Calendars and Tasks' > copy the URL."
-        Write-Host "    It is a password-like secret: never share it."
-        $ical = Read-Host "Calendar feed URL (Enter to skip)"
+        $icalLine = $null
+        $oldIcal = [string]$existing['MCGILL_ICAL_URL']
+        if ($oldIcal -match 'https?://') {
+            $icalLine = "MCGILL_ICAL_URL=$oldIcal"
+            Ok "Keeping the calendar feed URL already in .env"
+        } else {
+            Write-Host "    myCourses calendar feed: myCourses > Calendar > Subscribe > 'All Calendars and Tasks' > copy the URL."
+            Write-Host "    It is a password-like secret: never share it."
+            $ical = Read-Host "Calendar feed URL (Enter to skip)"
+            $icalLine = "MCGILL_ICAL_URL=$(Quote-Env $ical.Trim())"
+        }
         $lines = @(
             "MCGILL_USERNAME=$(Quote-Env $user)",
             "MCGILL_PASSWORD=$(Quote-Env $pw)",
@@ -111,40 +134,44 @@
             "TIMEOUT=30000",
             "SESSION_STATE_PATH=.mcgill_session.json",
             "MYCOURSES_TIMEZONE=America/Toronto",
-            "MCGILL_ICAL_URL=$(Quote-Env $ical.Trim())"
+            $icalLine
         )
         [IO.File]::WriteAllText($envFile, (($lines -join "`r`n") + "`r`n"), $Utf8NoBom)
         $pw = $null
+        # a session cached for another account (or a failed login) must not be reused
+        Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $Dest '.mcgill_session.json')
         Ok ".env written"
     }
 
     # ---------------------------------------------------------- 5. self-test
-    Step "Self-test"
-    Push-Location $Dest
-    try {
-        Run $venvPy @('-c', 'import mcp_server; print(''    MCP server imports OK'')')
-        $calTest = 'import os; from dotenv import load_dotenv; load_dotenv(''.env'', interpolate=False); from brightspace_api import fetch_calendar_events, filter_events_by_range; u = os.getenv(''MCGILL_ICAL_URL''); print(''    Calendar feed: '' + (str(len(filter_events_by_range(fetch_calendar_events(u), 14, 0))) + '' events in the next 14 days'' if u else ''skipped (no URL in .env)''))'
-        & $venvPy -c $calTest
-        if ($LASTEXITCODE -ne 0) { Warn "Calendar feed test failed - check MCGILL_ICAL_URL in .env" }
-    } finally { Pop-Location }
+    Step "Self-test: starting the server the way Claude Desktop does"
+    & $venvPy (Join-Path $Dest 'testing\selftest_stdio.py')
+    if ($LASTEXITCODE -ne 0) { throw "The MCP server does not start correctly - see the error above." }
 
     # ------------------------------------------------------ 6. Claude Desktop
     Step "Registering the server in Claude Desktop"
-    $candidates = @(Join-Path $env:APPDATA 'Claude\claude_desktop_config.json')
+    # Microsoft Store / MSIX builds of Claude Desktop read their config from a
+    # private package folder, NOT from %APPDATA%\Claude. Classic installs use
+    # %APPDATA%\Claude. Write to the right one (create it if needed).
+    $configDirs = @()
     $pkgRoot = Join-Path $env:LOCALAPPDATA 'Packages'
+    $msix = $null
     if (Test-Path $pkgRoot) {
-        $candidates += @(Get-ChildItem -Path $pkgRoot -Filter 'Claude_*' -Directory -ErrorAction SilentlyContinue |
-            ForEach-Object { Join-Path $_.FullName 'LocalCache\Roaming\Claude\claude_desktop_config.json' })
+        $msix = Get-ChildItem -Path $pkgRoot -Filter 'Claude_*' -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
     }
-    $targets = @($candidates | Where-Object { Test-Path $_ })
-    if ($targets.Count -eq 0 -and (Test-Path (Join-Path $env:APPDATA 'Claude'))) { $targets = @($candidates[0]) }
+    if ($msix) {
+        Ok "Claude Desktop (Microsoft Store / MSIX version) detected: $($msix.Name)"
+        $configDirs += (Join-Path $msix.FullName 'LocalCache\Roaming\Claude')
+        $appdataDir = Join-Path $env:APPDATA 'Claude'
+        if (Test-Path (Join-Path $appdataDir 'claude_desktop_config.json')) { $configDirs += $appdataDir }
+    } else {
+        $configDirs += (Join-Path $env:APPDATA 'Claude')
+    }
 
     $entry = [pscustomobject]@{ command = $venvPy; args = @((Join-Path $Dest 'mcp_server.py')) }
-    if ($targets.Count -eq 0) {
-        Warn "Claude Desktop config not found. In Claude Desktop: Settings > Developer > Edit Config, and add under mcpServers:"
-        Write-Host ((@{ 'mycourses-mcgill' = $entry } | ConvertTo-Json -Depth 5))
-    }
-    foreach ($cfg in $targets) {
+    foreach ($dir in $configDirs) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $cfg = Join-Path $dir 'claude_desktop_config.json'
         $json = [pscustomobject]@{}
         if (Test-Path $cfg) {
             Copy-Item $cfg ("$cfg.bak-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -156,12 +183,36 @@
         }
         $json.mcpServers | Add-Member -NotePropertyName 'mycourses-mcgill' -NotePropertyValue $entry -Force
         [IO.File]::WriteAllText($cfg, ($json | ConvertTo-Json -Depth 32), $Utf8NoBom)
-        Ok "Added 'mycourses-mcgill' to $cfg (backup kept next to it)"
+        Ok "Registered 'mycourses-mcgill' in $cfg"
     }
 
+    # ------------------------------------------------------- 7. restart Claude
+    Step "Restarting Claude Desktop (closing the window is not enough: it keeps running in the tray)"
+    $procs = @(Get-Process -Name 'claude' -ErrorAction SilentlyContinue)
+    if ($procs.Count -gt 0) {
+        $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+    }
+    $launched = $false
+    try {
+        if ($msix -and (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)) {
+            $appx = Get-AppxPackage | Where-Object { $_.PackageFamilyName -eq $msix.Name } | Select-Object -First 1
+            if ($appx) {
+                $appId = @((Get-AppxPackageManifest $appx).Package.Applications.Application)[0].Id
+                Start-Process "shell:AppsFolder\$($appx.PackageFamilyName)!$appId"
+                $launched = $true
+            }
+        } else {
+            $exe = Join-Path $env:LOCALAPPDATA 'AnthropicClaude\claude.exe'
+            if (Test-Path $exe) { Start-Process $exe; $launched = $true }
+        }
+    } catch { }
+    if ($launched) { Ok "Claude Desktop restarted" } else { Warn "Reopen Claude Desktop from the Start menu." }
+
     Step "Done"
-    Write-Host "  1. Quit Claude Desktop completely (tray icon near the clock > Quit), then reopen it."
-    Write-Host "  2. In a chat, ask: 'list my myCourses courses'. The first time, a browser window opens:"
-    Write-Host "     type your Authenticator code there. After that the session is cached and invisible."
-    Write-Host "  To update later: run the same one-line command again."
+    Write-Host "  In a new Claude chat, ask: 'list my myCourses courses'. The first time, a browser window"
+    Write-Host "  opens: sign in with your McGill account and type your Authenticator code there."
+    Write-Host "  After that the session is cached and invisible."
+    Write-Host "  To update later, or to re-enter credentials: run the same one-line command again"
+    Write-Host "  (delete $envFile first to change them)."
 }

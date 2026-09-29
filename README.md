@@ -110,6 +110,8 @@ If you'd rather verify the login flow standalone first: `python testing/playwrig
 - **No courses/assignments found** — myCourses' DOM can change between semesters/theme updates. `get_courses`/`get_assignments` fall back to a debug screenshot (`homepage_debug.png` / equivalent) on failure — compare it against the selectors in the code.
 - **Stale session** — delete `.mcgill_session.json` and retry; a fresh login (with its one-time visible window) will run automatically.
 - **MCP server not showing up in Claude** — verify the paths in your config are absolute, check Python version, restart Claude Desktop, and check `~/Library/Logs/Claude/` for errors.
+- **Windows, Microsoft Store (MSIX) Claude Desktop** — its config is `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json`, not `%APPDATA%\Claude\...` (the installer handles this). Quit it from the tray icon, not just the window. `python testing/selftest_stdio.py` tells you whether the server itself starts.
+- **`AADSTS50020 ... does not exist in tenant 'McGill University'`** — `MCGILL_USERNAME` is not your McGill account (e.g. a Gmail address). Re-run the installer (it re-asks) or fix `.env`, then delete `.mcgill_session.json`.
 
 ## Roadmap / good first issues
 

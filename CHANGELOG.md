@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.3.1] - 2026-09-29
+
+### Fixed
+- `install_windows.ps1` registered the server in `%APPDATA%\Claude` when no
+  config existed yet - but Microsoft Store (MSIX) builds of Claude Desktop read
+  `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude`. It now
+  writes there (creating the file if needed) and restarts Claude Desktop
+  (closing the window leaves it running in the tray).
+- The installer rejects a non-McGill username (a Gmail/Outlook address fails
+  McGill SSO with AADSTS50020) and re-asks on re-run if `.env` has one, keeping
+  the calendar URL and dropping the stale session.
+
+### Added
+- `testing/selftest_stdio.py`: starts the server over stdio exactly like Claude
+  Desktop and calls `hello` + `get_calendar`; the installer runs it before
+  registering.
+
 ## [2.3.0] - 2026-09-29
 
 ### Fixed
